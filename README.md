@@ -4,7 +4,7 @@ This project documents the operation and RF protocol of a CrowdSync wristband, a
 
 ## Flipper Zero Controller
 
-The [standalone Flipper Zero app](CrowdSync_Flipper_RF_App/README.md) transmits through the built-in radio, with no USB tether or GPIO wiring. It includes simple control of all groups, individual group assignments, hold-to-light operation, timed bursts, beat pulses and saved settings. A ready-to-install `.fap` and the C source are included.
+The [standalone Flipper Zero app](CrowdSync_Flipper_RF_App/README.md) transmits through the built-in radio. It includes simple control of all groups, individual group assignments, hold-to-light operation, timed bursts, beat pulses, persistent acquisition in black and saved settings. A ready-to-install `.fap` and the C source are included.
 
 ## RF Protocol
 

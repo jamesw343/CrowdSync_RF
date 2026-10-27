@@ -31,6 +31,7 @@ typedef enum {
     RowPreamble,
     RowBeatPeriod,
     RowBeatOn,
+    RowKeepAcquired,
     RowCopyAll,
     RowSave,
     RowLoad,
@@ -51,6 +52,7 @@ static const char *effects[] = {"Steady",       "Blink 6Hz",    "Blink 10Hz",  "
 typedef struct {
     bool advanced;
     bool preamble;
+    bool keep_acquired;
     uint8_t group;
     CsColor simple;
     CsColor groups[CS_GROUPS];
@@ -74,6 +76,10 @@ typedef struct {
     uint8_t help_page;
     bool transmitting;
     bool holding;
+    bool keeping_alive;
+    bool keepalive_acquiring;
+    bool keepalive_ready;
+    bool keepalive_suspended;
     bool exiting;
     bool acquired;
     bool tx_acquisition;
@@ -126,7 +132,7 @@ static void cs_settings_pack(const CsSettings *s, uint32_t data[SETTINGS_VALUES]
     data[k++] = s->burst;
     data[k++] = s->beat_period;
     data[k++] = s->beat_on;
-    data[k++] = 0; /* Reserved for future settings. */
+    data[k++] = s->keep_acquired; /* Formerly reserved; older settings store zero here. */
     for (size_t i = 0; i <= CS_GROUPS; ++i) {
         CsColor c = i ? s->groups[i - 1] : s->simple;
         data[k++] = c.effect;
@@ -140,7 +146,7 @@ static bool cs_settings_unpack(CsSettings *s, const uint32_t data[SETTINGS_VALUE
 {
     if (data[0] > 1 || data[1] > 1 || data[2] >= CS_GROUPS || data[3] >= CsSendModeCount ||
         data[4] >= COUNT(intervals_ms) || data[5] >= COUNT(bursts_ms) || data[6] >= COUNT(beats_ms) ||
-        data[7] >= COUNT(on_ms) || data[8] != 0)
+        data[7] >= COUNT(on_ms) || data[8] > 1)
         return false;
     for (size_t k = 9; k < SETTINGS_VALUES; ++k)
         if (data[k] > 15)
@@ -154,6 +160,7 @@ static bool cs_settings_unpack(CsSettings *s, const uint32_t data[SETTINGS_VALUE
     next.burst = data[5];
     next.beat_period = data[6];
     next.beat_on = data[7];
+    next.keep_acquired = data[8];
     if (on_ms[next.beat_on] + 100 > beats_ms[next.beat_period])
         return false;
     size_t k = 9;
@@ -238,6 +245,7 @@ static void cs_activity_update(CsApp *app)
         return;
     if (app->tx_power_save) {
         app->acquired = false;
+        app->keepalive_ready = false;
         return;
     }
     uint64_t acquisition_end = (uint64_t)(stream->frame_limit ? stream->frame_limit - 1 : 0) * stream->spacing_us[0] +
@@ -255,6 +263,8 @@ static void cs_activity_update(CsApp *app)
         app->last_activity = app->tx_started + (uint32_t)(completed * hz / 1000000);
         if ((uint32_t)(now - app->last_activity) >= 6 * hz)
             app->acquired = false;
+        else if (app->settings.keep_acquired)
+            app->keepalive_ready = true;
     }
 }
 
@@ -263,6 +273,9 @@ static void cs_stop(CsApp *app)
     if (!app->transmitting)
         return;
     cs_activity_update(app);
+    if (app->keepalive_acquiring && app->acquired)
+        app->keepalive_ready = true;
+    app->keepalive_acquiring = false;
     /* Stop DMA before touching the stream again. */
     subghz_devices_stop_async_tx(app->radio);
     subghz_devices_idle(app->radio);
@@ -271,9 +284,10 @@ static void cs_stop(CsApp *app)
     furi_hal_power_suppress_charge_exit();
     furi_hal_power_insomnia_exit();
     app->transmitting = false;
+    app->keeping_alive = false;
 }
 
-static bool cs_start(CsApp *app, bool black, bool all, uint32_t burst_ms, const char *name)
+static bool cs_start_tx(CsApp *app, bool black, bool all, uint32_t burst_ms, const char *name, bool keepalive)
 {
     cs_stop(app);
     CsSettings *s = &app->settings;
@@ -286,16 +300,16 @@ static bool cs_start(CsApp *app, bool black, bool all, uint32_t burst_ms, const 
                 colors[i] = (CsColor){0};
         }
     }
-    uint32_t interval = burst_ms ? 100 : intervals_ms[s->interval];
+    uint32_t interval = keepalive || burst_ms ? 100 : intervals_ms[s->interval];
     uint32_t frame_us = s->preamble ? 96480 : 82400;
     uint32_t limit = 0;
-    bool beat = !burst_ms && s->send_mode == CsBeat;
-    if (burst_ms)
+    bool beat = !keepalive && !burst_ms && s->send_mode == CsBeat;
+    if (!keepalive && burst_ms)
         limit = (burst_ms + interval - 1) / interval;
-    else if (s->send_mode == CsOnce) {
+    else if (!keepalive && s->send_mode == CsOnce) {
         limit = 1;
         interval = 0;
-    } else if (s->send_mode == CsBurst) {
+    } else if (!keepalive && s->send_mode == CsBurst) {
         limit = (bursts_ms[s->burst] + interval - 1) / interval;
     }
     bool valid =
@@ -328,10 +342,10 @@ static bool cs_start(CsApp *app, bool black, bool all, uint32_t burst_ms, const 
         return false;
     }
     app->tx_duration_ms = 0;
-    app->tx_show_time = !(black && burst_ms == 300);
-    if (burst_ms >= 3000 || (!burst_ms && s->send_mode == CsBurst))
+    app->tx_show_time = !keepalive && !(black && burst_ms == 300);
+    if (!keepalive && (burst_ms >= 3000 || (!burst_ms && s->send_mode == CsBurst)))
         app->tx_duration_ms = limit * interval;
-    if (!burst_ms) {
+    if (!keepalive && !burst_ms) {
         if (s->send_mode == CsOnce) {
             name = "Sending once";
             app->tx_show_time = false;
@@ -348,11 +362,54 @@ static bool cs_start(CsApp *app, bool black, bool all, uint32_t burst_ms, const 
         if (effect == 15)
             app->tx_power_save = true;
     }
+    app->keeping_alive = keepalive;
     app->transmitting = true;
     app->tx_started = furi_get_tick();
     snprintf(app->tx_name, sizeof(app->tx_name), "%s", name);
     app->notice_until = 0;
     return true;
+}
+
+static bool cs_start(CsApp *app, bool black, bool all, uint32_t burst_ms, const char *name)
+{
+    app->keepalive_suspended = false;
+    bool ok = cs_start_tx(app, black, all, burst_ms, name, false);
+    if (!ok)
+        app->keepalive_suspended = true;
+    return ok;
+}
+
+static void cs_keepalive_update(CsApp *app)
+{
+    if (app->page != CsTransmit || !app->settings.keep_acquired || app->exiting) {
+        if (app->keeping_alive)
+            cs_stop(app);
+        return;
+    }
+    if (app->keepalive_suspended)
+        return;
+    if (app->transmitting) {
+        if (app->keepalive_acquiring && app->acquired &&
+            (uint32_t)(furi_get_tick() - app->tx_started) >= furi_ms_to_ticks(3000)) {
+            app->keepalive_acquiring = false;
+            app->keepalive_ready = true;
+            app->tx_show_time = false;
+            app->tx_duration_ms = 0;
+            snprintf(app->tx_name, sizeof(app->tx_name), "433.92 Idle/KA");
+        }
+        return;
+    }
+    if (!app->keepalive_ready || !app->acquired) {
+        app->acquired = false;
+        app->keepalive_ready = false;
+        if (cs_start_tx(app, true, true, 0, "Acquiring", true)) {
+            app->keepalive_acquiring = true;
+            app->tx_show_time = true;
+            app->tx_duration_ms = 3000;
+        } else
+            app->keepalive_suspended = true;
+    } else if (!cs_start_tx(app, true, true, 0, "433.92 Idle/KA", true))
+        app->keepalive_suspended = true;
 }
 
 static uint8_t cs_cycle(uint8_t value, size_t count, int direction)
@@ -396,6 +453,12 @@ static void cs_adjust(CsApp *app, int direction)
     case RowPreamble:
         s->preamble = !s->preamble;
         break;
+    case RowKeepAcquired:
+        s->keep_acquired = !s->keep_acquired;
+        app->keepalive_suspended = !s->keep_acquired;
+        if (!s->keep_acquired && app->keeping_alive)
+            cs_stop(app);
+        break;
     case RowBeatPeriod:
         s->beat_period = cs_cycle(s->beat_period, COUNT(beats_ms), direction);
         while (on_ms[s->beat_on] + 100 > beats_ms[s->beat_period])
@@ -416,6 +479,10 @@ static void cs_activate(CsApp *app)
     switch (app->row) {
     case RowTransmit:
         app->page = CsTransmit;
+        app->keepalive_suspended = false;
+        app->keepalive_ready = false;
+        if (app->settings.keep_acquired)
+            app->acquired = false;
         break;
     case RowCopyAll: {
         CsColor color = *cs_selected(&app->settings);
@@ -427,9 +494,13 @@ static void cs_activate(CsApp *app)
     case RowSave:
         cs_notice(app, cs_settings_file(&app->settings, true) ? "Settings saved" : "Save failed: check SD");
         break;
-    case RowLoad:
-        cs_notice(app, cs_settings_file(&app->settings, false) ? "Settings loaded" : "No valid saved settings");
+    case RowLoad: {
+        bool ok = cs_settings_file(&app->settings, false);
+        if (ok)
+            app->keepalive_suspended = !app->settings.keep_acquired;
+        cs_notice(app, ok ? "Settings loaded" : "No valid saved settings");
         break;
+    }
     case RowHelp:
         app->page = CsHelp;
         app->help_page = 0;
@@ -454,7 +525,7 @@ static void cs_input_handle(CsApp *app, const InputEvent *event)
     if (app->page == CsTransmit) {
         if (app->settings.send_mode == CsToggle && event->key == InputKeyOk) {
             if (event->type == InputTypePress) {
-                if (app->transmitting)
+                if (app->transmitting && !app->keeping_alive)
                     cs_stop(app);
                 else
                     cs_start(app, false, false, 0, send_names[CsToggle]);
@@ -473,7 +544,7 @@ static void cs_input_handle(CsApp *app, const InputEvent *event)
         if (event->type != InputTypeShort)
             return;
         if (event->key == InputKeyOk) {
-            if (app->transmitting)
+            if (app->transmitting && !app->keeping_alive)
                 cs_stop(app);
             else
                 cs_start(app, false, false, 0, send_names[app->settings.send_mode]);
@@ -482,7 +553,8 @@ static void cs_input_handle(CsApp *app, const InputEvent *event)
             cs_start(app, true, true, 300, "Off");
         } else if (event->key == InputKeyRight) {
             app->holding = false;
-            cs_stop(app);
+            if (!app->keeping_alive)
+                cs_stop(app);
         } else if (event->key == InputKeyUp) {
             app->holding = false;
             cs_start(app, true, true, 3000, "Acquiring");
@@ -560,6 +632,9 @@ static void cs_row_text(CsApp *app, uint8_t row, char *text, size_t size)
     case RowBeatOn:
         snprintf(text, size, "Beat on: %lu ms", (unsigned long)on_ms[s->beat_on]);
         break;
+    case RowKeepAcquired:
+        snprintf(text, size, "Keep acquired: %s", s->keep_acquired ? "On" : "Off");
+        break;
     case RowCopyAll:
         snprintf(text, size, "Copy color to all");
         break;
@@ -599,6 +674,21 @@ static void cs_tx_status(const CsApp *app, char *text, size_t size)
     snprintf(text, size, "%s: %lus", app->tx_name, (unsigned long)seconds);
 }
 
+static void cs_acq_status(const CsApp *app, char *text, size_t size)
+{
+    uint32_t hz = furi_kernel_get_tick_frequency();
+    uint32_t age = furi_get_tick() - app->last_activity;
+    if (app->keepalive_acquiring)
+        snprintf(text, size, "ACQ?");
+    else if (app->acquired && age < 6 * hz) {
+        if (app->settings.keep_acquired && !app->keepalive_suspended && app->keepalive_ready)
+            snprintf(text, size, "ACQ-P");
+        else
+            snprintf(text, size, "ACQ %lus", (unsigned long)((6 * hz - age - 1) / hz + 1));
+    } else
+        snprintf(text, size, "ACQ?");
+}
+
 static void cs_draw(Canvas *canvas, void *context)
 {
     CsApp *app = context;
@@ -633,12 +723,7 @@ static void cs_draw(Canvas *canvas, void *context)
         CsColor *c = cs_selected(s);
         cs_tx_status(app, text, sizeof(text));
         canvas_draw_str(canvas, 1, 9, text);
-        uint32_t hz = furi_kernel_get_tick_frequency();
-        uint32_t age = furi_get_tick() - app->last_activity;
-        if (app->acquired && age < 6 * hz)
-            snprintf(text, sizeof(text), "ACQ %lus", (unsigned long)((6 * hz - age - 1) / hz + 1));
-        else
-            snprintf(text, sizeof(text), "ACQ?");
+        cs_acq_status(app, text, sizeof(text));
         canvas_draw_str_aligned(canvas, 126, 9, AlignRight, AlignBottom, text);
         if (s->advanced)
             snprintf(text, sizeof(text), "GRP%u", s->group + 1);
@@ -684,10 +769,10 @@ static void cs_draw(Canvas *canvas, void *context)
              "Save stores both profiles"},
             {"Toggle: OK start/stop", "Hold: release sends off", "Burst: timed transmission", "Once: one packet only",
              "Beat: color/black pulses"},
-            {"Up: dark acquire 3s", "Down: dark wake 25s", "Left: all off 300ms", "Right/Back stop radio",
-             "Stop does not send off"},
+            {"Up: dark acquire 3s", "Down: dark wake 25s", "Left: all off 300ms", "Right: stop command",
+             "Back: stop all radio"},
             {"Preamble helps after idle", "Repeat below 6s timeout", "Random effects turn RF off",
-             "Black may wait for RF", "Beat uses effect 0"},
+             "Black may wait for RF", "Keep acquired: idle black"},
         };
         snprintf(text, sizeof(text), "CrowdSync help %u/4", app->help_page + 1);
         canvas_draw_str(canvas, 1, 9, text);
@@ -708,6 +793,7 @@ int32_t crowdsync_app(void *argument)
     UNUSED(argument);
     CsApp *app = malloc(sizeof(CsApp));
     memset(app, 0, sizeof(*app));
+    app->keepalive_suspended = true; /* Even saved On settings must not auto-transmit at launch. */
     app->settings = cs_defaults();
     cs_settings_file(&app->settings, false);
     app->input = furi_message_queue_alloc(32, sizeof(InputEvent));
@@ -728,6 +814,7 @@ int32_t crowdsync_app(void *argument)
         cs_activity_update(app);
         if (app->transmitting && subghz_devices_is_async_complete_tx(app->radio))
             cs_stop(app);
+        cs_keepalive_update(app);
         furi_mutex_release(app->mutex);
         view_port_update(app->viewport);
     }
