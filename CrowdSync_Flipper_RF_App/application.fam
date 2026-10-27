@@ -1,0 +1,11 @@
+App(
+    appid="crowdsync",
+    name="CrowdSync",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="crowdsync_app",
+    requires=["gui", "storage"],
+    stack_size=4096,
+    fap_category="Sub-GHz",
+    fap_version="1.0",
+    fap_description="CrowdSync wristband controller: groups, RGB, effects and beat cues",
+)
